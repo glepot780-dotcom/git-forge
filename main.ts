@@ -388,56 +388,22 @@ function readPack(buf: Buffer): PackEntry[] | null {
       shift += 7;
       pos += 1;
     }
+    // One inflate does both jobs: the stream's length is read off the engine
+    // (bytesWritten = input bytes consumed), so there is no second inflate
+    // and no checksum scan to find where the stream ends.
     let data: Buffer;
     try {
-      data = inflateSync(buf.subarray(pos, buf.length - 20));
+      const result = inflateSync(buf.subarray(pos, buf.length - 20), { info: true });
+      data = result.buffer;
+      off = pos + result.engine.bytesWritten;
     } catch {
       return null;
     }
     if (data.length !== size) return null;
     const oid = hashObject(type as ObjectType, data);
     entries.push({ oid, type: type as ObjectType, data });
-    // Advance past the zlib stream: its last four bytes are the Adler-32 of
-    // the bytes just inflated, so the end is found by that checksum.
-    off = zlibStreamEnd(buf, pos, data);
-    if (off < 0) return null;
   }
   return entries;
-}
-
-/** Adler-32, the checksum a zlib stream ends with (big-endian, last 4 bytes). */
-function adler32(data: Buffer): number {
-  let a = 1;
-  let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a = (a + (data[i] as number)) % 65521;
-    b = (b + a) % 65521;
-  }
-  return ((b << 16) | a) >>> 0;
-}
-
-/**
- * The offset just past a zlib stream starting at `start`, given the bytes it
- * inflates to. The stream's last four bytes are the Adler-32 of its output,
- * so the end is where those four bytes sit; a candidate end is accepted only
- * when inflating up to it reproduces `expected` exactly, so a chance match
- * inside the deflate payload can never pass.
- */
-function zlibStreamEnd(buf: Buffer, start: number, expected: Buffer): number {
-  const needle = Buffer.alloc(4);
-  needle.writeUInt32BE(adler32(expected), 0);
-  let at = buf.indexOf(needle, start + 2);
-  while (at >= 0) {
-    const end = at + 4;
-    try {
-      const out = inflateSync(buf.subarray(start, end));
-      if (out.length === expected.length && out.equals(expected)) return end;
-    } catch {
-      // Not the true end: the bytes before it do not form this stream.
-    }
-    at = buf.indexOf(needle, at + 1);
-  }
-  return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +426,7 @@ interface Issue {
   state: 'open' | 'closed';
   labels: string[];
   seq: number;
-  jsonCache: string | null;
+  jsonCache: Buffer | null;
 }
 
 interface Comment {
@@ -996,8 +962,10 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
-function cachedIssueJson(repo: Repo, issue: Issue): string {
-  if (issue.jsonCache === null) issue.jsonCache = jsonString(issueJson(repo, issue));
+// Cached as a Buffer so the read path hands it straight to the socket
+// instead of re-encoding the string on every read.
+function cachedIssueJson(repo: Repo, issue: Issue): Buffer {
+  if (issue.jsonCache === null) issue.jsonCache = Buffer.from(jsonString(issueJson(repo, issue)), 'utf8');
   return issue.jsonCache;
 }
 
@@ -2597,6 +2565,10 @@ function handleMcp(req: Req): Res {
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
+// One shared empty query set for requests with no `?`. Handlers only call
+// .get() on it, never mutate it, so sharing it across requests is safe.
+const EMPTY_PARAMS = new URLSearchParams();
+
 interface ParsedRequest {
   method: string;
   path: string;
@@ -2628,12 +2600,33 @@ function tryParseRequest(buf: Buffer): { request: ParsedRequest; consumed: numbe
   const connection = headers.get('connection') ?? '';
   const version = parts[2] ?? 'HTTP/1.1';
   const keepAlive = connection.toLowerCase() === 'keep-alive' || (version === 'HTTP/1.1' && connection.toLowerCase() !== 'close');
-  let url: URL;
-  try {
-    url = new URL(rawTarget, 'http://127.0.0.1');
-  } catch {
-    return null;
+  // Fast path: most requests carry no query string, so skip the URL parser
+  // entirely and only decode the path when it actually holds a % escape.
+  let path: string;
+  let query: URLSearchParams;
+  const qmark = rawTarget.indexOf('?');
+  if (qmark < 0) {
+    if (rawTarget.includes('%')) {
+      try {
+        path = decodeURIComponent(rawTarget);
+      } catch {
+        path = rawTarget;
+      }
+    } else {
+      path = rawTarget;
+    }
+    query = EMPTY_PARAMS;
+  } else {
+    let url: URL;
+    try {
+      url = new URL(rawTarget, 'http://127.0.0.1');
+    } catch {
+      return null;
+    }
+    path = url.pathname;
+    query = url.searchParams;
   }
+  const segments = path.split('/').filter((part) => part !== '');
   const transferEncoding = (headers.get('transfer-encoding') ?? '').toLowerCase();
   const contentLength = Number(headers.get('content-length') ?? '0');
   let bodyStart = headerEnd + 4;
@@ -2653,9 +2646,9 @@ function tryParseRequest(buf: Buffer): { request: ParsedRequest; consumed: numbe
         if (trailerEnd < 0) {
           // No trailer headers: the chunk stream ends with a bare CRLF.
           if (buf.length < dataStart + 2) return null;
-          return { request: { method, path: url.pathname, query: url.searchParams, segments: url.pathname.split('/').filter((part) => part !== ''), headers, host, body: Buffer.concat(chunks), keepAlive }, consumed: dataStart + 2 };
+          return { request: { method, path, query, segments, headers, host, body: Buffer.concat(chunks), keepAlive }, consumed: dataStart + 2 };
         }
-        return { request: { method, path: url.pathname, query: url.searchParams, segments: url.pathname.split('/').filter((part) => part !== ''), headers, host, body: Buffer.concat(chunks), keepAlive }, consumed: trailerEnd + 4 };
+        return { request: { method, path, query, segments, headers, host, body: Buffer.concat(chunks), keepAlive }, consumed: trailerEnd + 4 };
       }
       if (buf.length < dataStart + size + 2) return null;
       chunks.push(buf.subarray(dataStart, dataStart + size));
@@ -2667,9 +2660,9 @@ function tryParseRequest(buf: Buffer): { request: ParsedRequest; consumed: numbe
   return {
     request: {
       method,
-      path: url.pathname,
-      query: url.searchParams,
-      segments: url.pathname.split('/').filter((part) => part !== ''),
+      path,
+      query,
+      segments,
       headers,
       host,
       body: buf.subarray(bodyStart, bodyStart + contentLength),
@@ -2713,6 +2706,21 @@ function route(req: Req): Res {
     if (req.method === 'GET' && req.path === '/healthz') {
       return jsonRes(200, { ok: true });
     }
+    // Fast path: the API routes can never be git paths (a git path's second
+    // segment ends in `.git`, while these are exactly `v3` / `graphql`, or
+    // the bare `/mcp`), so skip the git regex for them.
+    if (req.path === '/api/v3' || req.path.startsWith('/api/v3/')) {
+      if (req.segments.length >= 2 && req.segments[0] === 'api' && req.segments[1] === 'v3') {
+        return handleRest({ ...req, segments: req.segments.slice(2) });
+      }
+      return errRes(404, 'Not Found');
+    }
+    if (req.method === 'POST' && req.path === '/api/graphql') {
+      return handleGraphQL(req);
+    }
+    if (req.method === 'POST' && req.path === '/mcp') {
+      return handleMcp(req);
+    }
     const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(req.path);
     if (gitMatch !== null) {
       const owner = decodeURIComponent(gitMatch[1] as string);
@@ -2728,15 +2736,6 @@ function route(req: Req): Res {
       }
       if (req.method !== 'POST') return errRes(405, 'Method Not Allowed');
       return gitReceivePack(req, owner, repoName);
-    }
-    if (req.method === 'POST' && req.path === '/api/graphql') {
-      return handleGraphQL(req);
-    }
-    if (req.method === 'POST' && req.path === '/mcp') {
-      return handleMcp(req);
-    }
-    if (req.segments.length >= 2 && req.segments[0] === 'api' && req.segments[1] === 'v3') {
-      return handleRest({ ...req, segments: req.segments.slice(2) });
     }
     return errRes(404, 'Not Found');
   } catch (error) {
